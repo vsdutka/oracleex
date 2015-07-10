@@ -211,14 +211,15 @@ func TestExecScalarTests(t *testing.T) {
 	<-time.After(time.Second)
 	holder.closeAll()
 	commandsDump(fname + ".load")
-	vI := commandsLoad(fname)
-	vR := commandsLoad(fname + ".load")
 
-	if len(vI) != len(vR) {
-		t.Fatalf("Saved commands len should by %v, was %v", len(vI), len(vR))
+	vI := newCommandPlayers(fname)
+	vR := newCommandPlayers(fname + ".load")
+
+	if len(vI.cmds) != len(vR.cmds) {
+		t.Fatalf("Saved commands len should by %v, was %v", len(vI.cmds), len(vR.cmds))
 	}
-	for i, vIItem := range vI {
-		vRItem := vR[i]
+	for i, vIItem := range vI.cmds {
+		vRItem := vR.cmds[i]
 		if vIItem.StreamID != vRItem.StreamID {
 			t.Fatalf("%d. StreamID should by \"%v\", was \"%v\"", i, vIItem.StreamID, vRItem.StreamID)
 		}

@@ -121,7 +121,6 @@ func (cur *Cursor) Execute(statement string, listArgs []interface{}, keywordArgs
 		delete(params, "яfn_scn")
 	}
 	if err != nil {
-		fmt.Println(err)
 		if cur.holder != "" {
 			execCmd(cur.holder, cur.streamID, statement, params, bg, time.Now(), serverBg, serverFn, serverFnScn, false, err.Error())
 		}

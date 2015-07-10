@@ -11,43 +11,155 @@ import (
 	"os"
 	//"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"sync"
+	"time"
 )
 
+type commandForPlaying struct {
+	command
+	wg         sync.WaitGroup
+	waiters    []int // The list of positions of the commands expecting this
+	relativeBg time.Duration
+	cmdPos     int
+}
+
 type commandPlayer struct {
-	srcChan chan command
+	srcChan chan commandForPlaying
 	//conn    *oracle.Connection
+}
+type commandSlice []commandForPlaying
+
+func (p commandSlice) Len() int {
+	return len(p)
+}
+
+func (p commandSlice) Less(i, j int) bool {
+	return p[i].ClientBg.Before(p[j].ClientBg)
+}
+
+func (p commandSlice) Swap(i, j int) {
+	p[i], p[j] = p[j], p[i]
 }
 
 type commandPlayers struct {
 	sync.Mutex
-	players      map[string]commandPlayer
-	sigChan      chan uint64
-	finishedCmds map[uint64]bool
+	players map[string]commandPlayer
+	sigChan chan []int //Список позиций комманд, которым нужно послать сигнал о завершении их предшественника
+	cmds    commandSlice
+	startDt time.Time
 }
 
-func newCommandPlayers() commandPlayers {
-	players := commandPlayers{players: make(map[string]commandPlayer), finishedCmds: make(map[uint64]bool), sigChan: make(chan uint64, 1000)}
-	go func(p commandPlayers) {
+func newCommandPlayers(fileName string) commandPlayers {
+	players := commandPlayers{
+		players: make(map[string]commandPlayer),
+		sigChan: make(chan []int, 1000),
+		cmds:    make([]commandForPlaying, 0),
+	}
+	go func(p *commandPlayers) {
 		for {
 			select {
-			case cmdID := <-p.sigChan:
+			case cmdPos := <-p.sigChan:
 				{
-					p.finishedCmds[cmdID] = true
+					func() {
+						p.Lock()
+						defer p.Unlock()
+						for _, pos := range cmdPos {
+							p.cmds[pos].wg.Done()
+						}
+					}()
 				}
 			}
 		}
-	}(players)
+	}(&players)
+	players.commandsLoad(fileName)
 	return players
 }
-func (cps *commandPlayers) runOp(cmd command, holderName string) {
-	c := func(streamID string) chan command {
+
+func (cps *commandPlayers) commandsLoad(fileName string) {
+	if fileName == "" {
+		return
+	}
+	buf := func() bytes.Buffer {
+		var r bytes.Buffer
+
+		f, err := os.OpenFile(fileName, os.O_RDONLY, 0644)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+		_, err = r.ReadFrom(f)
+		if err != nil {
+			panic(err)
+		}
+		return r
+	}()
+	//Чтение даты и времени начала сбора информации по командам
+	var startDt time.Time
+	dec := gob.NewDecoder(&buf)
+	err := dec.Decode(&startDt)
+	if err != nil {
+		panic(err)
+	}
+	cps.startDt = startDt
+	k := 1
+	for {
+		k++
+		if k > 1000 {
+			break
+		}
+		dec := gob.NewDecoder(&buf)
+		var v commandForPlaying
+		err := dec.Decode(&v)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			panic(err)
+		}
+		v.waiters = make([]int, 0)
+		v.relativeBg = v.ClientBg.Sub(startDt)
+		cps.cmds = append(cps.cmds, v)
+	}
+	// Заполнение структур waiters
+	sort.Sort(cps.cmds)
+	for i, _ := range cps.cmds {
+		cps.cmds[i].cmdPos = i
+		prevCmds := make(map[string]int)
+		for j := 0; j < i; j++ {
+			if cps.cmds[i].ClientBg.Sub(cps.cmds[j].ClientFn) >= 0 {
+				prevCmds[cps.cmds[j].StreamID] = j
+			}
+		}
+
+		for _, pos := range prevCmds {
+			cps.cmds[pos].waiters = append(cps.cmds[pos].waiters, i)
+			cps.cmds[i].wg.Add(1)
+		}
+	}
+}
+
+func (cps *commandPlayers) play(holderFileName string) {
+	startDt := time.Now()
+	for i, _ := range cps.cmds {
+		// Ожидаем завершения всех комманд, которые должны закончиться до начала этой
+		cps.cmds[i].wg.Wait()
+		// Высчитывает момент, когда нужно запустить эту команду
+		cmdWaitBeforeStart := startDt.Add(cps.cmds[i].relativeBg).Sub(time.Now())
+		<-time.After(cmdWaitBeforeStart)
+		cps.runCmd(cps.cmds[i], holderFileName)
+	}
+
+}
+
+func (cps *commandPlayers) runCmd(cmd commandForPlaying, holderName string) {
+	c := func(streamID string) chan commandForPlaying {
 		cps.Lock()
 		defer cps.Unlock()
 		r, ok := cps.players[streamID]
 		if !ok {
-			r = commandPlayer{srcChan: make(chan command)}
+			r = commandPlayer{srcChan: make(chan commandForPlaying)}
 			cps.players[streamID] = r
 			go func() {
 				defer func() {
@@ -139,21 +251,24 @@ func (cps *commandPlayers) runOp(cmd command, holderName string) {
 											}
 											if pval.IsArray {
 
-												var vals []interface{}
-												for _, p := range pval.Value {
+												for i, p := range pval.Value {
 													if pval.Type == "Float" && reflect.TypeOf(p).Name() == "string" {
 														fR, err := strconv.ParseFloat(p.(string), 64)
 														if err != nil {
 															panic(err)
 														}
-														vals = append(vals, fR)
+														err = v.SetValue(uint(i), fR)
+														if err != nil {
+															//fmt.Printf("%s, %v, %v", pname, pval.Type, vals)
+															panic(err)
+														}
 													} else {
-														vals = append(vals, p)
+														err = v.SetValue(uint(i), p)
+														if err != nil {
+															//fmt.Printf("%s, %v, %v", pname, pval.Type, vals)
+															panic(err)
+														}
 													}
-												}
-												err = v.SetValue(0, vals)
-												if err != nil {
-													panic(err)
 												}
 												params[pname] = v
 											} else {
@@ -171,6 +286,7 @@ func (cps *commandPlayers) runOp(cmd command, holderName string) {
 												}
 												err = v.SetValue(0, vals)
 												if err != nil {
+													//fmt.Printf("%s, %v, %v", pname, pval.Type, vals)
 													panic(err)
 												}
 												params[pname] = v
@@ -183,7 +299,7 @@ func (cps *commandPlayers) runOp(cmd command, holderName string) {
 							}
 							//FIXME - run
 							// Сигнализируем о завершении выполнения операции
-							cps.sigChan <- cmd.CmdID
+							cps.sigChan <- cmd.waiters
 							if cmd.CmdType == cmLogout {
 								return
 							}
@@ -199,51 +315,16 @@ func (cps *commandPlayers) runOp(cmd command, holderName string) {
 }
 
 func Play(fileName string) {
-	ops := commandsLoad(fileName)
-	p := newCommandPlayers()
-	for _, op := range ops {
-		p.runOp(op, fileName+".load")
-	}
-
-}
-
-func commandsLoad(fileName string) []command {
-	buf := func() bytes.Buffer {
-		var r bytes.Buffer
-
-		f, err := os.OpenFile(fileName, os.O_RDONLY, 0644)
-		if err != nil {
-			panic(err)
-		}
-		defer f.Close()
-		_, err = r.ReadFrom(f)
-		if err != nil {
-			panic(err)
-		}
-		return r
-	}()
-
-	var res []command
-	for {
-		dec := gob.NewDecoder(&buf)
-		var v command
-		err := dec.Decode(&v)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			panic(err)
-		}
-		res = append(res, v)
-	}
-	return res
+	//ops := commandsLoad(fileName)
+	p := newCommandPlayers(fileName)
+	p.play(fileName + ".load")
 }
 
 func commandsDump(fileName string) {
-	cmds := commandsLoad(fileName)
+	p := newCommandPlayers(fileName)
 	var buffer bytes.Buffer
 	defer buffer.Reset()
-	for _, cmd := range cmds {
+	for _, cmd := range p.cmds {
 		buffer.WriteString(fmt.Sprintln("StreamID    = ", cmd.StreamID))
 		buffer.WriteString(fmt.Sprintln("OperationID = ", cmd.CmdID))
 		buffer.WriteString(fmt.Sprintln("Type        = ", cmdType(cmd.CmdType)))

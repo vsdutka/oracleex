@@ -4,7 +4,7 @@ package oracleex
 import (
 	"encoding/gob"
 	"fmt"
-	"github.com/xlab/closer"
+	//"github.com/xlab/closer"
 	"gopkg.in/goracle.v1/oracle"
 	"os"
 	"path/filepath"
@@ -29,7 +29,7 @@ var holder = commandHolder{channels: make(map[string]commandHolderChannel)}
 var cmdCounter uint64
 
 func init() {
-	closer.Bind(cleanup)
+	//closer.Bind(cleanup)
 	gob.Register(time.Time{})
 	gob.Register(0.5)
 }
@@ -69,6 +69,14 @@ func (l *commandHolder) getHolderChannel(holderName string) chan command {
 				panic(err)
 			}
 			defer f.Close()
+			// Сохранение метки начала
+			enc := gob.NewEncoder(f)
+			startDt := time.Now()
+			err = enc.Encode(&startDt)
+			if err != nil {
+				fmt.Println(err)
+			}
+
 			for {
 				select {
 				case cmd := <-c.cmdChan:
